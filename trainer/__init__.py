@@ -5,6 +5,7 @@ from util.registry import Registry
 TRAINER = Registry('Trainer')
 
 files = glob.glob('trainer/[!_]*.py')
+
 for file in files:
 	model_lib = importlib.import_module(file.split('.')[0].replace('/', '.'))
 

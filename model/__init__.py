@@ -82,5 +82,6 @@ def get_model(cfg_model):
 	return model
 
 files = glob.glob('model/[!_]*.py')
+# files = ['model/mambaad.py']
 for file in files:
 	model_lib = importlib.import_module(file.split('.')[0].replace('/', '.'))

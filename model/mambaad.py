@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 try:
-	from torch.hub import load_state_dict_from_url
+    from torch.hub import load_state_dict_from_url
 except ImportError:
-	from torch.utils.model_zoo import load_url as load_state_dict_from_url
+    from torch.utils.model_zoo import load_url as load_state_dict_from_url
 from timm.models.resnet import Bottleneck
 
 from model import get_model
@@ -24,15 +24,348 @@ import numpy as np
 from hilbert import decode, encode
 from pyzorder import ZOrderIndexer
 
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+           
+        self.fc = nn.Sequential(nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False),
+                               nn.ReLU(),
+                               nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False))
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)*x
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x0 = x
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)*x0
+
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        x = self.ca(x)
+        x = self.sa(x)
+        return x
+
+class DWConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,padding=1,dilation=1):
+        super().__init__()
+        self.dconv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size,padding=padding,stride=stride, groups=in_channels,dilation=1),
+            nn.InstanceNorm2d(in_channels),nn.SiLU())
+        self.pconv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1),
+            nn.InstanceNorm2d(out_channels),nn.SiLU())
+ 
+    def forward(self, x):
+        x = self.dconv(x)
+        return self.pconv(x)
+
+
+
+def add_jitter(feature_tokens, scale=20, prob=1):
+    """
+    Args:
+        feature_tokens : B N C
+    """
+    import random
+    device = feature_tokens.device
+    if random.uniform(0, 1) <= prob:
+        B, N, C = feature_tokens.shape
+        feature_norms = (feature_tokens.norm(dim=2).unsqueeze(2) / C)
+        jitter = torch.randn((B, N, C)).to(device)
+        jitter = jitter * feature_norms * scale
+        feature_tokens = feature_tokens + jitter
+    return feature_tokens
+
+class Mlp(nn.Module):
+    def __init__(self, 
+                 in_features,
+                 hidden_features=None,
+                 out_features=None,
+                 act_layer=nn.SiLU,
+                 drop=0.):
+        super().__init__()
+        
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+
+        return x
+
+class Attention(nn.Module):
+    def __init__(self,q,k,v,norm,act,pe=None):
+        super().__init__()
+        self.q=q
+        self.k=k
+        self.v=v
+        self.scale = self.q.size(-1)**-0.5
+        b,h,n,c = self.q.shape
+        
+        self.ffn = Mlp(h*c)
+    
+        self.pe = pe
+    def forward(self):
+        # qkv shape b h N c ::pe b h N n
+        b,h,n,c = self.q.shape
+        self.k = self.k.transpose(-1,-2)# b h c n
+        attn_score = self.pe + ((self.q @ self.k)*self.scale).softmax(-1) # b h N n
+        atten = attn_score @ self.v # b h N c
+        out = atten.permute(0,2,1,3).reshape(b,n,-1) # b N h*c
+        out = self.ffn(out) # b N h*c        
+        return out.contiguous() # b N h*c
+
+class ToProxy(nn.Module):
+    def __init__(self,dim=512,head_num = 8,agent_q_num=7**2,agent_kv_num=7**2,norm=nn.InstanceNorm2d,act=nn.SiLU):
+        super().__init__()
+        self.agent_q_num = agent_q_num
+        self.learnable_q = nn.Parameter(torch.randn(1,agent_q_num,dim))
+        self.learnable_kv = nn.Parameter(torch.randn(1,agent_kv_num,dim))
+        self.q = nn.Linear(dim,dim)
+        self.kv_x = nn.Linear(dim,dim*2)
+        self.kv_y = nn.Linear(dim,dim*2)
+        self.norm = norm(dim)
+        self.act = act()
+        self.head = head_num
+        self.q_2 = nn.Linear(dim,dim)
+    def forward(self,x):
+        b,h,w,c = x.shape
+        head = self.head
+        x = x.permute(0,3,1,2).reshape(b,c,-1).transpose(1,2) # bnc
+        learnable_q = self.learnable_q.repeat(b,1,1) # b N(agent_q_num) c
+        q = self.q(learnable_q).reshape(b,self.agent_q_num,head,c//head).permute(0,2,1,3) # b h N c
+        k,v = self.kv_x(x).chunk(2,dim=-1)
+        k = k.reshape(b,h*w,head,c//head).permute(0,2,1,3) # b h n c
+        v = v.reshape(b,h*w,head,c//head).permute(0,2,1,3) # b h n c
+        atn = Attention(q,k,v,self.norm,self.act).to(x.device) 
+        front_out = atn() # b N C
+        # 第二阶段
+        q = self.q_2(front_out).reshape(b,self.agent_q_num,head,c//head).permute(0,2,1,3) # b h N c
+        learnable_v = self.learnable_kv.repeat(b,1,1) # b N1(agent_kv_num) c
+        b,N1,c = learnable_v.shape
+        k,v = self.kv_y(learnable_v).chunk(2,dim=-1)
+        k = k.reshape(b,N1,head,c//head).permute(0,2,1,3) # b h n c
+        v = v.reshape(b,N1,head,c//head).permute(0,2,1,3) # b h n c
+        atn = Attention(q,k,v,self.norm,self.act).to(x.device)
+        out = atn() # b N C
+        # 上采样到原始尺寸
+        h1 = w1 = int(self.agent_q_num**0.5)
+        out = out.reshape(b,h1,w1,-1).permute(0,3,1,2) # b c h1 w1
+        out = F.interpolate(out,(h,w)).permute(0,2,3,1).contiguous()
+        return out
+        
+class ToProxy2(nn.Module):
+    def __init__(self,dim=512,head_num = 8,agent_q_num=8**2,agent_kv_num=8**2,norm=nn.InstanceNorm2d,act=nn.SiLU):
+        super().__init__()
+        self.agent_q_num = agent_q_num
+        self.learnable_q = nn.Parameter(torch.zeros(1,agent_q_num,dim))
+        self.learnable_kv = nn.Parameter(torch.zeros(1,agent_kv_num,dim))
+        self.q = nn.Linear(dim,dim)
+        self.kv_x = nn.Linear(dim,dim*2)
+        self.kv_y = nn.Linear(dim,dim*2)
+        self.norm = norm(dim)
+        self.act = act()
+        self.head = head_num
+        self.q_2 = nn.Linear(dim,dim)
+        self.pe1 = nn.Parameter(torch.zeros(1,head_num,1,agent_kv_num))
+        self.pe2 = nn.Parameter(torch.zeros(1,head_num,agent_q_num,1))
+        
+    def forward(self,x):
+        b,h,w,c = x.shape
+        head = self.head
+         
+         
+         
+        learnable_q = self.learnable_q.repeat(b,1,1) # b N(agent_q_num) c
+        q = self.q(learnable_q).reshape(b,self.agent_q_num,head,c//head).permute(0,2,1,3) # b h N c
+        k,v = self.kv_x(x).chunk(2,dim=-1) # b n c 
+        
+        k = k.reshape(b,h*w,head,c//head).permute(0,2,1,3) # b h n c
+        v = v.reshape(b,h*w,head,c//head).permute(0,2,1,3) # b h n c
+        pe2 = self.pe2.repeat(b,1,1,h*w)
+        atn = Attention(q,k,v,self.norm,self.act,pe=pe2).to(x.device) 
+        fin_out = atn() # b agent_q_num C
+        # 上采样到原始尺寸
+        h1 = w1 = int(self.agent_q_num**0.5)
+        out = fin_out.reshape(b,h1,w1,-1).permute(0,3,1,2) # b c h1 w1
+        out = F.interpolate(out,(h,w)).permute(0,2,3,1) #b h w c 
+        out = out + x
+        mskip = out
+         
+        # 
+        q = self.q_2(out).reshape(b,h*w,-1).reshape(b,h*w,head,c//head).permute(0,2,1,3) # b h N c
+        learnable_v = self.learnable_kv.repeat(b,1,1) # b N1(agent_kv_num) c
+        pe1 = self.pe1.repeat(b,1,h*w,1)
+        b,N1,c = learnable_v.shape
+        k,v = self.kv_y(learnable_v).chunk(2,dim=-1)
+        k = k.reshape(b,N1,head,c//head).permute(0,2,1,3) # b h n c
+        v = v.reshape(b,N1,head,c//head).permute(0,2,1,3) # b h n c
+        atn = Attention(q,k,v,self.norm,self.act,pe=pe1).to(x.device)
+        out = atn().reshape(b,h,w,-1)+mskip+x
+        return out.contiguous()
+
+class ProxyAttentionBlock(nn.Module):
+    def __init__(self,agent_num=16,dim = 512,head_num = 8,dp=0.,attn_dp=0.):
+        super().__init__()
+        self.agent_tokens_v = nn.Parameter(torch.randn(1,agent_num,dim))
+        self.agent_tokens_k = nn.Parameter(torch.randn(1,agent_num,dim))
+        self.head_num = head_num
+        self.agent_num = agent_num
+        self.k = nn.Linear(dim,dim)
+        self.v = nn.Linear(dim,dim)
+        self.q = nn.Linear(dim,dim)
+        self.scale = (dim//head_num) ** -0.5
+        self.proj = nn.Linear(dim,dim)
+        self.dp = nn.Dropout(dp)
+        self.atndp = nn.Dropout(attn_dp)
+        # self.proxyX = ProxyX(agent_num=agent_num,agent=self.agent_tokens,dim=dim,head_num=head_num,dp=dp,attn_dp=attn_dp)
+        
+        # self.norm = nn.InstanceNorm2d(dim)
+        self.cat = ChannelAttention(agent_num)
+    def forward(self,x):
+        b,h,w,c = x.shape
+        # x1 = self.proxyX(x)
+        x1 = x
+        x1 = x1.reshape(b,-1,c) # b hw c
+        q = self.q(x1).reshape(b,h*w,self.head_num,c//self.head_num).permute(0,2,1,3) # b h hw c
+        agent_tokens_k = self.agent_tokens_k.repeat(b,1,1) # b n c
+        agent_tokens_v = self.agent_tokens_v.repeat(b,1,1) # b n c
+        k,v = self.k(agent_tokens_k),self.v(agent_tokens_v)
+        k = k.reshape(b,self.agent_num,self.head_num,c//self.head_num).permute(0,2,3,1) #b h c n
+        attn_score = ((q @ k) * self.scale).softmax(-1) # b h N n
+        attn_score = self.atndp(attn_score)
+        attn_score = self.cat(attn_score.permute(0,3,1,2)).permute(0,2,3,1)
+        v = v.reshape(b,self.agent_num,self.head_num,c//self.head_num).permute(0,2,1,3) #b h n c
+        atte = (attn_score @ v).permute(0,2,1,3).reshape(b,h,w,-1) # b h w c
+        out = self.dp(self.proj(atte)).contiguous()
+        return out
+
+class ProxyX(nn.Module):
+    def __init__(self,agent_num=32,agent=None,dim = 512,head_num = 8,dp=0.,attn_dp=0.):
+        super().__init__()
+        self.agent_tokens = agent
+        self.head_num = head_num
+        self.agent_num = agent_num
+        self.kv = nn.Linear(dim,dim*2)
+        self.q = nn.Linear(dim,dim)
+        self.scale = (dim//head_num) ** -0.5
+        self.proj = nn.Linear(dim,dim)
+        self.dp = nn.Dropout(dp)
+        self.atndp = nn.Dropout(attn_dp)
+        
+    def forward(self,x):
+        b,h,w,c = x.shape
+        x1 = x.reshape(b,-1,c) # b hw c
+        q = self.q(x1).reshape(b,h*w,self.head_num,c//self.head_num).permute(0,2,1,3) # b h hw c
+        agent_tokens = self.agent_tokens.repeat(b,1,1) # b n c
+        k,v = self.kv(agent_tokens).chunk(2,dim = -1) #
+        k = k.reshape(b,self.agent_num,self.head_num,c//self.head_num).permute(0,2,3,1) #b h c n
+        attn_score = ((q @ k) * self.scale).softmax(-1) # b h N n
+        attn_score = self.atndp(attn_score)
+        v = v.reshape(b,self.agent_num,self.head_num,c//self.head_num).permute(0,2,1,3) #b h n c
+        atte = (attn_score @ v).permute(0,2,1,3).reshape(b,h,w,-1) # b h w c
+        atte = self.dp(self.proj(atte))
+        return atte
+class ConvMambaBlock(nn.Module):
+    def __init__(self,
+            hidden_dim: int = 0,
+            drop_path: float = 0,
+            norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+            attn_drop_rate: float = 0,
+            d_state: int = 16,
+            size: int = 8,
+            scan_type: str = 'scan',
+            num_direction: int = 8,
+            **kwargs):
+        
+        super().__init__()
+        self.toProxy = ToProxy2(dim=hidden_dim)
+        self.conv33 = DWConv(hidden_dim, hidden_dim, 3,padding=1)
+        self.conv55 = DWConv(hidden_dim, hidden_dim, 5,padding=2)
+        self.mlp = nn.Sequential(nn.Conv2d(hidden_dim*2, hidden_dim, 1),nn.InstanceNorm2d(hidden_dim),nn.SiLU())  
+        self.l = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.InstanceNorm2d(hidden_dim)
+        self.act = nn.SiLU()
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        
+    def forward(self, x):
+        conv_input = x.permute(0, 3, 1, 2)
+        out = self.toProxy(x)
+        y33 = self.conv33(conv_input).permute(0,2,3,1) # b h w c 
+        y55 = self.conv55(conv_input).permute(0,2,3,1) # b h w c
+        # y35 = (y33+y55).permute(0,2,3,1)
+        y33 = self.mlp(torch.cat([y33,y55],dim=-1).permute(0,3,1,2)).permute(0,2,3,1)
+        
+        # out = self.mlp(torch.cat([agent,y35],dim=-1).permute(0,3,1,2)).permute(0,2,3,1)#bhwc
+        out = self.act(self.norm(self.l(out+y33).permute(0,3,1,2))).permute(0,2,3,1)
+        out = self.l2(out)
+        out = out + x
+        
+        return out.contiguous()
+    
+
+
+class LSSModule_v2(nn.Module):
+    def __init__(self,
+            hidden_dim: int = 0,
+            drop_path: float = 0,
+            norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+            attn_drop_rate: float = 0,
+            d_state: int = 16,
+            depth: int = 2,
+            size: int = 8,
+            scan_type: str = 'scan',
+            num_direction: int = 8,
+            **kwargs):
+            super().__init__()
+            self.convMamba = nn.ModuleList([ConvMambaBlock(hidden_dim=hidden_dim, drop_path=drop_path, norm_layer=norm_layer, attn_drop_rate=attn_drop_rate, d_state=d_state, size=size, scan_type=scan_type, num_direction=num_direction,**kwargs) for _ in range(1)])
+    def forward(self, x):
+        # x -  B H W C
+        out = x
+        for block in self.convMamba:
+            out = block(out)
+        return out
+    
+
 # ========== Decoder ==========
 def conv3x3(in_planes, out_planes, stride = 1, groups = 1, dilation = 1):
-	return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=dilation, groups=groups, bias=False, dilation=dilation)
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=dilation, groups=groups, bias=False, dilation=dilation)
 
 def conv1x1(in_planes, out_planes, stride = 1) -> nn.Conv2d:
-	return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 def deconv2x2(in_planes, out_planes, stride = 1, groups = 1, dilation = 1):
-	return nn.ConvTranspose2d(in_planes, out_planes, kernel_size=2, stride=stride, groups=groups, bias=False, dilation=dilation)
+    return nn.ConvTranspose2d(in_planes, out_planes, kernel_size=2, stride=stride, groups=groups, bias=False, dilation=dilation)
 
 class PatchExpand2D(nn.Module):
     def __init__(self, dim, dim_scale=2, norm_layer=nn.LayerNorm):
@@ -49,366 +382,10 @@ class PatchExpand2D(nn.Module):
         x= self.norm(x)
         return x
 
-class SCANS(nn.Module):
-	def __init__(self, size=16, dim=2, scan_type='scan', ):
-		super().__init__()
-		size = int(size)
-		max_num = size ** dim
-		indexes = np.arange(max_num)
-		if 'sweep' == scan_type:  # ['sweep', 'scan', 'zorder', 'zigzag', 'hilbert']
-			locs_flat = indexes
-		elif 'scan' == scan_type:
-			indexes = indexes.reshape(size, size)
-			for i in np.arange(1, size, step=2):
-				indexes[i, :] = indexes[i, :][::-1]
-			locs_flat = indexes.reshape(-1)
-		elif 'zorder' == scan_type:
-			zi = ZOrderIndexer((0, size - 1), (0, size - 1))
-			locs_flat = []
-			for z in indexes:
-				r, c = zi.rc(int(z))
-				locs_flat.append(c * size + r)
-			locs_flat = np.array(locs_flat)
-		elif 'zigzag' == scan_type:
-			indexes = indexes.reshape(size, size)
-			locs_flat = []
-			for i in range(2 * size - 1):
-				if i % 2 == 0:
-					start_col = max(0, i - size + 1)
-					end_col = min(i, size - 1)
-					for j in range(start_col, end_col + 1):
-						locs_flat.append(indexes[i - j, j])
-				else:
-					start_row = max(0, i - size + 1)
-					end_row = min(i, size - 1)
-					for j in range(start_row, end_row + 1):
-						locs_flat.append(indexes[j, i - j])
-			locs_flat = np.array(locs_flat)
-		elif 'hilbert' == scan_type:
-			bit = int(math.log2(size))
-			locs = decode(indexes, dim, bit)
-			locs_flat = self.flat_locs_hilbert(locs, dim, bit)
-		else:
-			raise Exception('invalid encoder mode')
-		locs_flat_inv = np.argsort(locs_flat)
-		index_flat = torch.LongTensor(locs_flat.astype(np.int64)).unsqueeze(0).unsqueeze(1)
-		index_flat_inv = torch.LongTensor(locs_flat_inv.astype(np.int64)).unsqueeze(0).unsqueeze(1)
-		self.index_flat = nn.Parameter(index_flat, requires_grad=False)
-		self.index_flat_inv = nn.Parameter(index_flat_inv, requires_grad=False)
 
-	def flat_locs_hilbert(self, locs, num_dim, num_bit):
-		ret = []
-		l = 2 ** num_bit
-		for i in range(len(locs)):
-			loc = locs[i]
-			loc_flat = 0
-			for j in range(num_dim):
-				loc_flat += loc[j] * (l ** j)
-			ret.append(loc_flat)
-		return np.array(ret).astype(np.uint64)
 
-	def __call__(self, img):
-		img_encode = self.encode(img)
-		return img_encode
-
-	def encode(self, img):
-		img_encode = torch.zeros(img.shape, dtype=img.dtype, device=img.device).scatter_(2, self.index_flat_inv.expand(img.shape), img)
-		return img_encode
-
-	def decode(self, img):
-		img_decode = torch.zeros(img.shape, dtype=img.dtype, device=img.device).scatter_(2, self.index_flat.expand(img.shape), img)
-		return img_decode
-
-class SS2D(nn.Module):
-    def __init__(
-            self,
-            d_model,
-            d_state=16,
-            d_conv=3,
-            expand=2,
-            dt_rank="auto",
-            dt_min=0.001,
-            dt_max=0.1,
-            dt_init="random",
-            dt_scale=1.0,
-            dt_init_floor=1e-4,
-            dropout=0.,
-            conv_bias=True,
-            bias=False,
-            device=None,
-            dtype=None,
-            size=8,
-            scan_type='scan',
-            num_direction=8,
-            **kwargs,
-    ):
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
-        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-
-        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
-        self.conv2d = nn.Conv2d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            groups=self.d_inner,
-            bias=conv_bias,
-            kernel_size=d_conv,
-            padding=(d_conv - 1) // 2,
-            **factory_kwargs,
-        )
-        self.act = nn.SiLU()
-        self.num_direction = num_direction
-
-        x_proj_weight = [nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs).weight for _ in range(self.num_direction)]
-        self.x_proj_weight = nn.Parameter(torch.stack(x_proj_weight, dim=0))
-        dt_projs = [self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor, **factory_kwargs) for _ in range(self.num_direction)]
-        self.dt_projs_weight = nn.Parameter(torch.stack([dt_proj.weight for dt_proj in dt_projs], dim=0))
-        self.dt_projs_bias = nn.Parameter(torch.stack([dt_proj.bias for dt_proj in dt_projs], dim=0))
-
-        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=self.num_direction, merge=True)  # (K=4, D, N)
-        self.Ds = self.D_init(self.d_inner, copies=self.num_direction, merge=True)  # (K=4, D, N)
-
-        self.out_norm = nn.LayerNorm(self.d_inner)
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
-        self.dropout = nn.Dropout(dropout) if dropout > 0. else None
-        self.scans = SCANS(size=size, scan_type=scan_type)
-
-    @staticmethod
-    def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
-                **factory_kwargs):
-        dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
-        # Initialize special dt projection to preserve variance at initialization
-        dt_init_std = dt_rank ** -0.5 * dt_scale
-        if dt_init == "constant":
-            nn.init.constant_(dt_proj.weight, dt_init_std)
-        elif dt_init == "random":
-            nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
-        else:
-            raise NotImplementedError
-        # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
-        dt = torch.exp(
-            torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
-        ).clamp(min=dt_init_floor)
-        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        with torch.no_grad():
-            dt_proj.bias.copy_(inv_dt)
-        # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
-        dt_proj.bias._no_reinit = True
-        return dt_proj
-
-    @staticmethod
-    def A_log_init(d_state, d_inner, copies=1, device=None, merge=True):
-        # S4D real initialization
-        A = repeat(
-            torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
-            "n -> d n",
-            d=d_inner,
-        ).contiguous()
-        A_log = torch.log(A)  # Keep A_log in fp32
-        if copies > 1:
-            A_log = repeat(A_log, "d n -> r d n", r=copies)
-            if merge:
-                A_log = A_log.flatten(0, 1)
-        A_log = nn.Parameter(A_log)
-        A_log._no_weight_decay = True
-        return A_log
-
-    @staticmethod
-    def D_init(d_inner, copies=1, device=None, merge=True):
-        # D "skip" parameter
-        D = torch.ones(d_inner, device=device)
-        if copies > 1:
-            D = repeat(D, "n1 -> r n1", r=copies)
-            if merge:
-                D = D.flatten(0, 1)
-        D = nn.Parameter(D)  # Keep in fp32
-        D._no_weight_decay = True
-        return D
-
-    def forward_core(self, x: torch.Tensor):
-        self.selective_scan = selective_scan_fn
-        B, C, H, W = x.shape
-        L = H * W
-        K = self.num_direction
-        xs = []
-        if K >= 2:
-            xs.append(self.scans.encode(x.view(B, -1, L)))
-        if K >= 4:
-            xs.append(self.scans.encode(torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)))
-        if K >= 8:
-            xs.append(self.scans.encode(torch.rot90(x, k=1, dims=(2, 3)).contiguous().view(B, -1, L)))
-            xs.append(self.scans.encode(torch.transpose(torch.rot90(x, k=1, dims=(2, 3)), dim0=2, dim1=3).contiguous().view(B, -1, L)))
-        xs = torch.stack(xs,dim=1).view(B, K // 2, -1, L)
-        xs = torch.cat([xs, torch.flip(xs, dims=[-1])], dim=1)
-
-        x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
-        dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
-        dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
-
-        xs = xs.float().view(B, -1, L)  # (b, k * d, l)
-        dts = dts.contiguous().float().view(B, -1, L)  # (b, k * d, l)
-        Bs = Bs.float().view(B, K, -1, L)  # (b, k, d_state, l)
-        Cs = Cs.float().view(B, K, -1, L)  # (b, k, d_state, l)
-        Ds = self.Ds.float().view(-1)  # (k * d)
-        As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)  # (k * d, d_state)
-        dt_projs_bias = self.dt_projs_bias.float().view(-1)  # (k * d)
-
-        out_y = self.selective_scan(
-            xs, dts,
-            As, Bs, Cs, Ds, z=None,
-            delta_bias=dt_projs_bias,
-            delta_softplus=True,
-            return_last_state=False,
-        ).view(B, K, -1, L)
-        assert out_y.dtype == torch.float
-        # out_y = xs
-
-        inv_y = torch.flip(out_y[:, K // 2:K], dims=[-1]).view(B, K // 2, -1, L)
-        ys = []
-        if K >= 2:
-            ys.append(self.scans.decode(out_y[:, 0]))
-            ys.append(self.scans.decode(inv_y[:, 0]))
-        if K >= 4:
-            ys.append(torch.transpose(self.scans.decode(out_y[:, 1]).view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L))
-            ys.append(torch.transpose(self.scans.decode(inv_y[:, 1]).view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L))
-        if K >= 8:
-            ys.append(torch.rot90(self.scans.decode(out_y[:, 2]).view(B, -1, W, H), k=3, dims=(2,3)).contiguous().view(B, -1, L))
-            ys.append(torch.rot90(self.scans.decode(inv_y[:, 2]).view(B, -1, W, H), k=3, dims=(2,3)).contiguous().view(B, -1, L))
-            ys.append(torch.rot90(torch.transpose(self.scans.decode(out_y[:, 3]).view(B, -1, W, H), dim0=2, dim1=3), k=3, dims=(2,3)).contiguous().view(B, -1, L))
-            ys.append(torch.rot90(torch.transpose(self.scans.decode(inv_y[:, 3]).view(B, -1, W, H), dim0=2, dim1=3), k=3, dims=(2,3)).contiguous().view(B, -1, L))
-        y = sum(ys)
-        return y
-
-    def forward(self, x: torch.Tensor, **kwargs):
-        B, H, W, C = x.shape
-        xz = self.in_proj(x)
-        x, z = xz.chunk(2, dim=-1)  # (b, h, w, d)
-        x = x.permute(0, 3, 1, 2).contiguous()
-        x = self.act(self.conv2d(x))  # (b, d, h, w)
-        y = self.forward_core(x)
-        y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
-        y = self.out_norm(y)
-        y = y * F.silu(z)
-        out = self.out_proj(y)
-        if self.dropout is not None:
-            out = self.dropout(out)
-        return out
-
-class VSSBlock(nn.Module):
-    def __init__(
-        self,
-        hidden_dim: int = 0,
-        drop_path: float = 0,
-        norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
-        attn_drop_rate: float = 0,
-        d_state: int = 16,
-		size: int = 8,
-		scan_type='scan',
-		num_direction=4,
-        **kwargs,
-    ):
-        super().__init__()
-        self.ln_1 = norm_layer(hidden_dim)
-        self.self_attention = SS2D(d_model=hidden_dim, dropout=attn_drop_rate, d_state=d_state, size=size, scan_type=scan_type, num_direction=num_direction, **kwargs)
-        self.drop_path = DropPath(drop_path)
-
-    def forward(self, input: torch.Tensor):
-        x = input + self.drop_path(self.self_attention(self.ln_1(input)))
-        return x
-
-class ConvBNSSMBlock(nn.Module):
-	def __init__(
-			self,
-			hidden_dim: int = 0,
-			drop_path: float = 0,
-			norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
-			attn_drop_rate: float = 0,
-			d_state: int = 16,
-			depth: int = 2,
-			size: int = 8,
-			scan_type: str = 'scan',
-			num_direction: int = 8,
-			**kwargs,
-	):
-		super().__init__()
-		self.smm_blocks = nn.ModuleList([
-			VSSBlock(hidden_dim=hidden_dim, drop_path=drop_path, norm_layer=norm_layer, attn_drop_rate=attn_drop_rate, d_state=d_state, size=size, scan_type=scan_type, num_direction=num_direction,**kwargs)
-			for i in range(depth)])
-		self.conv1b3 = nn.Sequential(
-			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1),
-			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
-		)
-		self.conv1a3 = nn.Sequential(
-			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1),
-			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
-		)
-		self.conv1b5 = nn.Sequential(
-			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1),
-			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
-		)
-		self.conv1a5 = nn.Sequential(
-			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1),
-			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
-		)
-		self.conv33 = nn.Sequential(
-			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=3, stride=1, padding=1, bias=False,
-					  groups=hidden_dim),
-			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
-		)
-		self.conv55 = nn.Sequential(
-			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=5, stride=1, padding=2, bias=False,
-					  groups=hidden_dim),
-			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
-		)
-		self.conv77 = nn.Sequential(
-			nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=7, stride=1, padding=3, bias=False,
-					  groups=hidden_dim),
-			nn.InstanceNorm2d(hidden_dim),
-			nn.SiLU(),
-		)
-		self.finalconv11 = nn.Conv2d(in_channels=hidden_dim * 3, out_channels=hidden_dim, kernel_size=1, stride=1)
-		self.apply(self._init_weights)
-
-	def _init_weights(self, m):
-		"""
-		initialization
-		"""
-		if isinstance(m, nn.Conv2d):
-			fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-			fan_out //= m.groups
-			m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
-			if m.bias is not None:
-				m.bias.data.zero_()
-		# elif isinstance(m, nn.InstanceNorm2d):
-		# 	m.weight.data.fill_(1)
-		# 	m.bias.data.zero_()
-
-	def forward(self, input: torch.Tensor):
-		out_ssm = input
-		for blk in self.smm_blocks:
-			out_ssm = blk(out_ssm)
-		input_conv = input.permute(0, 3, 1, 2).contiguous()
-		out_77 = self.conv1a3(self.conv77(self.conv1b3(input_conv)))
-		out_55 = self.conv1a5(self.conv55(self.conv1b5(input_conv)))
-		output = torch.cat((out_ssm.permute(0, 3, 1, 2).contiguous(), out_55, out_77), dim=1)
-		output = self.finalconv11(output).permute(0, 2, 3, 1).contiguous()
-		return output + input
-
-class VSSLayer_up(nn.Module):
-	""" A basic Swin Transformer layer for one stage.
+class LSSLayer_up(nn.Module):
+    """ A basic Swin Transformer layer for one stage.
     Args:
         dim (int): Number of input channels.
         depth (int): Number of blocks.
@@ -419,229 +396,246 @@ class VSSLayer_up(nn.Module):
         downsample (nn.Module | None, optional): Downsample layer at the end of the layer. Default: None
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False.
     """
-	def __init__(
-			self,
-			dim,
-			depth,
-			attn_drop=0.,
-			drop_path=0.,
-			norm_layer=nn.LayerNorm,
-			upsample=None,
-			use_checkpoint=False,
-			d_state=16,
-			size=8,
-			scan_type='scan',
-			num_direction=4,
-			**kwargs,
-	):
-		super().__init__()
-		self.dim = dim
-		self.use_checkpoint = use_checkpoint
+    def __init__(
+            self,
+            dim,
+            depth,
+            attn_drop=0.,
+            drop_path=0.,
+            norm_layer=nn.LayerNorm,
+            upsample=None,
+            use_checkpoint=False,
+            d_state=16,
+            size=8,
+            scan_type='scan',
+            num_direction=4,
+            **kwargs,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.use_checkpoint = use_checkpoint
 
-		if depth % 3 == 0:
-			self.blocks = nn.ModuleList([
-				ConvBNSSMBlock(
-					hidden_dim=dim,
-					drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-					norm_layer=norm_layer,
-					attn_drop_rate=attn_drop,
-					d_state=d_state,
-					size=size,
-					scan_type=scan_type,
-					depth=3,
-					num_direction=num_direction,
-				)
-				for i in range(depth//3)])
-		elif depth % 2 == 0:
-			self.blocks = nn.ModuleList([
-				ConvBNSSMBlock(
-					hidden_dim=dim,
-					drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-					norm_layer=norm_layer,
-					attn_drop_rate=attn_drop,
-					d_state=d_state,
-					size=size,
-					scan_type=scan_type,
-					depth=2,
-					num_direction=num_direction,
-				)
-				for i in range(depth // 2)])
+        if depth % 3 == 0:
+            self.blocks = nn.ModuleList([
+                LSSModule_v2(
+                    hidden_dim=dim,
+                    drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                    norm_layer=norm_layer,
+                    attn_drop_rate=attn_drop,
+                    d_state=d_state,
+                    size=size,
+                    scan_type=scan_type,
+                    depth=3,
+                    num_direction=num_direction,
+                )
+                for i in range(depth)])
+        elif depth % 2 == 0:
+            self.blocks = nn.ModuleList([
+                LSSModule_v2(
+                    hidden_dim=dim,
+                    drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                    norm_layer=norm_layer,
+                    attn_drop_rate=attn_drop,
+                    d_state=d_state,
+                    size=size,
+                    scan_type=scan_type,
+                    depth=2,
+                    num_direction=num_direction,
+                )
+                for i in range(depth)])
+        else:
+            self.blocks = nn.ModuleList([
+                LSSModule_v2(
+                    hidden_dim=dim,
+                    drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                    norm_layer=norm_layer,
+                    attn_drop_rate=attn_drop,
+                    d_state=d_state,
+                    size=size,
+                    scan_type=scan_type,
+                    depth=2,
+                    num_direction=num_direction,
+                )
+                for i in range(depth)])
 
-		if True:  # is this really applied? Yes, but been overriden later in VSSM!
-			def _init_weights(module: nn.Module):
-				for name, p in module.named_parameters():
-					if name in ["out_proj.weight"]:
-						p = p.clone().detach_()  # fake init, just to keep the seed ....
-						nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+        if True:  # is this really applied? Yes, but been overriden later in VSSM!
+            def _init_weights(module: nn.Module):
+                for name, p in module.named_parameters():
+                    if name in ["out_proj.weight"]:
+                        p = p.clone().detach_()  # fake init, just to keep the seed ....
+                        nn.init.kaiming_uniform_(p, a=math.sqrt(5))
 
-			self.apply(_init_weights)
+            self.apply(_init_weights)
 
-		if upsample is not None:
-			self.upsample = upsample(dim=dim, norm_layer=norm_layer)
-		else:
-			self.upsample = None
+        if upsample is not None:
+            self.upsample = upsample(dim=dim, norm_layer=norm_layer)
+        else:
+            self.upsample = None
 
-	def forward(self, x):
-		if self.upsample is not None:
-			x = self.upsample(x)
-		for blk in self.blocks:
-			if self.use_checkpoint:
-				x = checkpoint.checkpoint(blk, x)
-			else:
-				x = blk(x)
-		return x
+    def forward(self, x):
+        if self.upsample is not None:
+            x = self.upsample(x)
+        for blk in self.blocks:
+            if self.use_checkpoint:
+                x = checkpoint.checkpoint(blk, x)
+            else:
+                x = blk(x)
+        return x
 
 class MambaUPNet(nn.Module):
-	def __init__(self, dims_decoder=[512, 256, 128, 64], depths_decoder=[2, 2, 2, 2],d_state=16, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.2,
-				 norm_layer = nn.LayerNorm,scan_type='scan', num_direction=4, ):
-		super().__init__()
-		dpr_decoder = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths_decoder))][::-1]
-		self.layers_up = nn.ModuleList()
-		for i_layer in range(len(depths_decoder)):
-			layer = VSSLayer_up(
-				dim=dims_decoder[i_layer],
-				depth=depths_decoder[i_layer],
-				d_state=d_state,
-				drop=drop_rate,
-				attn_drop=attn_drop_rate,
-				drop_path=dpr_decoder[sum(depths_decoder[:i_layer]):sum(depths_decoder[:i_layer + 1])],
-				norm_layer=norm_layer,
-				upsample=PatchExpand2D if (i_layer != 0) else None,
-				size=8 * 2 ** (i_layer),
-				scan_type=scan_type,
-				num_direction=num_direction,
-			)
-			self.layers_up.append(layer)
-		self.apply(self._init_weights)
+    def __init__(self, dims_decoder=[512, 256, 128, 64], depths_decoder=[3, 4, 6, 3],d_state=16, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.2,
+                 norm_layer = nn.LayerNorm,scan_type='scan', num_direction=4, ):
+        super().__init__()
+        dpr_decoder = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths_decoder))][::-1]
+        self.layers_up = nn.ModuleList()
+        for i_layer in range(len(depths_decoder)):
+            layer = LSSLayer_up(
+                dim=dims_decoder[i_layer],
+                depth=depths_decoder[i_layer],
+                d_state=d_state,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=dpr_decoder[sum(depths_decoder[:i_layer]):sum(depths_decoder[:i_layer + 1])],
+                norm_layer=norm_layer,
+                upsample=PatchExpand2D if (i_layer != 0) else None,
+                size=8 * 2 ** (i_layer),
+                scan_type=scan_type,
+                num_direction=num_direction,
+            )
+            self.layers_up.append(layer)
+        self.apply(self._init_weights)
 
-	def _init_weights(self, m: nn.Module):
-		"""
-        out_proj.weight which is previously initilized in VSSBlock, would be cleared in nn.Linear
+    def _init_weights(self, m: nn.Module):
+        """
+        out_proj.weight which is previously initilized in HSSBlock, would be cleared in nn.Linear
         no fc.weight found in the any of the model parameters
         no nn.Embedding found in the any of the model parameters
-        so the thing is, VSSBlock initialization is useless
+        so the thing is, HSSBlock initialization is useless
 
         Conv2D is not intialized !!!
         """
-		if isinstance(m, nn.Linear):
-			trunc_normal_(m.weight, std=.02)
-			if isinstance(m, nn.Linear) and m.bias is not None:
-				nn.init.constant_(m.bias, 0)
-		elif isinstance(m, nn.LayerNorm):
-			nn.init.constant_(m.bias, 0)
-			nn.init.constant_(m.weight, 1.0)
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
-	@torch.jit.ignore
-	def no_weight_decay(self):
-		return {'absolute_pos_embed'}
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'absolute_pos_embed'}
 
-	@torch.jit.ignore
-	def no_weight_decay_keywords(self):
-		return {'relative_position_bias_table'}
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {'relative_position_bias_table'}
 
-	def forward(self, x):
-		x = rearrange(x,'b c h w -> b h w c')
-		out_features = []
-		for i, layer in enumerate(self.layers_up):
-			x = layer(x)
-			if i != 0:
-				out_features.insert(0, rearrange(x,'b h w c -> b c h w'))
-		return out_features
+    def forward(self, x):
+        x = rearrange(x,'b c h w -> b h w c')
+        out_features = []
+        for i, layer in enumerate(self.layers_up):
+            x = layer(x)
+            if i != 0:
+                out_features.insert(0, rearrange(x,'b h w c -> b c h w'))
+        return out_features
 
-# ========== MFF & OCE ==========
 class MFF_OCE(nn.Module):
-	def __init__(self, block, layers, width_per_group = 64, norm_layer = None, ):
-		super(MFF_OCE, self).__init__()
-		if norm_layer is None:
-			norm_layer = nn.BatchNorm2d
-		self._norm_layer = norm_layer
-		self.base_width = width_per_group
-		self.inplanes = 64 * block.expansion
-		self.dilation = 1
-		self.bn_layer = self._make_layer(block, 128, layers, stride=2)
+    def __init__(self, block, layers, width_per_group = 64, norm_layer = None, ):
+        super(MFF_OCE, self).__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        self._norm_layer = norm_layer
+        self.base_width = width_per_group
+        self.inplanes = 64 * block.expansion
+        self.dilation = 1
+        self.bn_layer = self._make_layer(block, 128, layers, stride=2)
 
-		self.conv1 = conv3x3(16 * block.expansion, 32 * block.expansion, 2)
-		self.bn1 = norm_layer(32 * block.expansion)
-		self.conv2 = conv3x3(32 * block.expansion, 64 * block.expansion, 2)
-		self.bn2 = norm_layer(64 * block.expansion)
-		self.conv21 = nn.Conv2d(32 * block.expansion, 32 * block.expansion, 1)
-		self.bn21 = norm_layer(32 * block.expansion)
-		self.conv31 = nn.Conv2d(64 * block.expansion, 64 * block.expansion, 1)
-		self.bn31 = norm_layer(64 * block.expansion)
-		self.convf = nn.Conv2d(64 * block.expansion, 64 * block.expansion, 1)
-		self.bnf = norm_layer(64 * block.expansion)
-		self.relu = nn.ReLU(inplace=True)
-		for m in self.modules():
-			if isinstance(m, nn.Conv2d):
-				nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-			elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-				nn.init.constant_(m.weight, 1)
-				nn.init.constant_(m.bias, 0)
+        self.conv1 = conv3x3(16 * block.expansion, 32 * block.expansion, 2)
+        self.bn1 = norm_layer(32 * block.expansion)
+        self.conv2 = conv3x3(32 * block.expansion, 64 * block.expansion, 2)
+        self.bn2 = norm_layer(64 * block.expansion)
+        self.conv21 = nn.Conv2d(32 * block.expansion, 32 * block.expansion, 1)
+        self.bn21 = norm_layer(32 * block.expansion)
+        self.conv31 = nn.Conv2d(64 * block.expansion, 64 * block.expansion, 1)
+        self.bn31 = norm_layer(64 * block.expansion)
+        self.convf = nn.Conv2d(64 * block.expansion, 64 * block.expansion, 1)
+        self.bnf = norm_layer(64 * block.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
-	def _make_layer(self, block, planes, blocks, stride = 1, dilate = False):
-		norm_layer = self._norm_layer
-		downsample = None
-		previous_dilation = self.dilation
-		if dilate:
-			self.dilation *= stride
-			stride = 1
-		if stride != 1 or self.inplanes != planes * block.expansion:
-			downsample = nn.Sequential(conv1x1(self.inplanes, planes * block.expansion, stride),
-									   norm_layer(planes * block.expansion), )
-		layers = []
-		layers.append(block(self.inplanes, planes, stride, downsample, base_width=self.base_width, dilation=previous_dilation, norm_layer=norm_layer))
-		self.inplanes = planes * block.expansion
-		for _ in range(1, blocks):
-			layers.append(block(self.inplanes, planes, base_width=self.base_width, dilation=self.dilation, norm_layer=norm_layer))
-		return nn.Sequential(*layers)
+    def _make_layer(self, block, planes, blocks, stride = 1, dilate = False):
+        norm_layer = self._norm_layer
+        downsample = None
+        previous_dilation = self.dilation
+        if dilate:
+            self.dilation *= stride
+            stride = 1
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(conv1x1(self.inplanes, planes * block.expansion, stride),
+                                       norm_layer(planes * block.expansion), )
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample, base_width=self.base_width, dilation=previous_dilation, norm_layer=norm_layer))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes, base_width=self.base_width, dilation=self.dilation, norm_layer=norm_layer))
+        return nn.Sequential(*layers)
 
-	def forward(self, x):
-		fpn0 = self.relu(self.bn1(self.conv1(x[0])))
-		fpn1 = self.relu(self.bn21(self.conv21(x[1]))) + fpn0
-		sv_features = self.relu(self.bn2(self.conv2(fpn1))) + self.relu(self.bn31(self.conv31(x[2])))
-		sv_features = self.relu(self.bnf(self.convf(sv_features)))
-		sv_features = self.bn_layer(sv_features)
+    def forward(self, x):
+        fpn0 = self.relu(self.bn1(self.conv1(x[0])))
+        fpn1 = self.relu(self.bn21(self.conv21(x[1]))) + fpn0
+        sv_features = self.relu(self.bn2(self.conv2(fpn1))) + self.relu(self.bn31(self.conv31(x[2])))
+        sv_features = self.relu(self.bnf(self.convf(sv_features)))
+        sv_features = self.bn_layer(sv_features)
 
-		return sv_features.contiguous()
+        return sv_features.contiguous()
 
 class MAMBAAD(nn.Module):
-	def __init__(self, model_t, model_s):
-		super(MAMBAAD, self).__init__()
-		self.net_t = get_model(model_t)
-		self.mff_oce = MFF_OCE(Bottleneck, 3)
-		self.net_s = MambaUPNet(depths_decoder=model_s['depths_decoder'], scan_type=model_s['scan_type'], num_direction=model_s['num_direction'])
+    def __init__(self, model_t, model_s):
+        super(MAMBAAD, self).__init__()
+        self.net_t = get_model(model_t)
+        self.mff_oce = MFF_OCE(Bottleneck, 3)
+        self.net_s = MambaUPNet(depths_decoder=model_s['depths_decoder'], scan_type=model_s['scan_type'], num_direction=model_s['num_direction'])
 
-		self.frozen_layers = ['net_t']
+        self.frozen_layers = ['net_t']
+        
+    def freeze_layer(self, module):
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
 
-	def freeze_layer(self, module):
-		module.eval()
-		for param in module.parameters():
-			param.requires_grad = False
+    def train(self, mode=True):
+        self.training = mode
+        for mname, module in self.named_children():
+            if mname in self.frozen_layers:
+                self.freeze_layer(module)
+            else:
+                module.train(mode)
+        return self
 
-	def train(self, mode=True):
-		self.training = mode
-		for mname, module in self.named_children():
-			if mname in self.frozen_layers:
-				self.freeze_layer(module)
-			else:
-				module.train(mode)
-		return self
-
-	def forward(self, imgs):
-		feats_t = self.net_t(imgs)
-		feats_t = [f.detach() for f in feats_t]
-		feats_s = self.net_s(self.mff_oce(feats_t))
-		return feats_t, feats_s
+    def forward(self, imgs):
+        feats_t = self.net_t(imgs)
+        feats_t = [f.detach() for f in feats_t]
+        oce_out = self.mff_oce(feats_t)  # 16 512 8 8
+        b,c,h,w = oce_out.shape
+        scale=20 if self.training else 0
+        oce_out = add_jitter(oce_out.reshape(b,c,h*w).permute(0,2,1),scale=scale).reshape(b,h,w,c).permute(0,3,1,2).contiguous()
+        feats_s = self.net_s(oce_out)
+        return feats_t, feats_s
 
 @MODEL.register_module
 def mambaad(pretrained=False, **kwargs):
-	model = MAMBAAD(**kwargs)
-	return model
+    model = MAMBAAD(**kwargs)
+    return model
 
 if __name__ == '__main__':
     from fvcore.nn import FlopCountAnalysis, flop_count_table, parameter_count
     from util.util import get_timepc, get_net_params
-    vmunet = MambaUPNet([512, 256, 128, 64], [2, 2, 2, 2])
+    vmunet = MambaUPNet([512, 256, 128, 64], [3, 4, 6, 3])
     bs = 1
     reso = 8
     x = torch.randn(bs, 512, reso, reso).cuda()

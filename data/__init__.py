@@ -10,6 +10,7 @@ TRANSFORMS = Registry('Transforms')
 DATA = Registry('Data')
 
 files = glob.glob('data/[!_]*.py')
+
 for file in files:
 	model_lib = importlib.import_module(file.split('.')[0].replace('/', '.'))
 
