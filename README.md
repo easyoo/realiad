@@ -13,6 +13,7 @@ pip3 install fastprogress geomloss FrEIA mamba_ssm adeval fvcore==0.1.5.post2022
 在configs/mambaad/mambaad_realiad.py中设置self.data.root
 
 训练：
+参数设置好了，直接运行
 python run.py
 
 mambaad的训练日志好像是100轮，我多设置了50轮
